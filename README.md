@@ -54,6 +54,25 @@ Create access keys in the Console (Object Storage → Access keys). Reuse one
 `Client` for the life of your program: it is thread-safe and keeps
 connections open.
 
+## Public buckets and folders
+
+```python
+from thailandhosting_objectstorage import Client, PublicRule
+
+# Anyone may read images/ (and nothing else) without a key; needs a key
+# allowed to manage buckets. [] makes the bucket private again.
+bucket.set_public_access([PublicRule("images/")])
+print(bucket.public_url("images/logo.png"))
+# https://objects.bkk.thailandhosting.com/my-bucket/images/logo.png
+
+# A client without a key reads (and, where allowed, lists) public objects.
+anon = Client("https://objects.bkk.thailandhosting.com")
+data = anon.bucket("my-bucket").get_bytes("images/logo.png")
+```
+
+What a key may do (buckets, folders, read / list / write / delete,
+managing buckets, an expiry date) is set on the key in the Console.
+
 ## Performance
 
 | | |
@@ -91,6 +110,7 @@ Hashing and socket I/O release the GIL, so parts really move in parallel.
 | `head`, `exists`, `delete`, `delete_many`, `copy` | object operations |
 | `list` (one page), `iter_objects` | listing |
 | `create_link(key, expires_in=, upload=)` | a link that needs no key |
+| `public_access()`, `set_public_access(rules)`, `public_url(key)` | make the bucket or some folders readable by anyone, and their URLs |
 | `create_multipart_upload`, `resume_multipart_upload` → `upload_part`, `parts`, `complete`, `abort` | do-it-yourself multipart |
 
 Errors from the service raise `ObjectStorageError` (`status`, `code`,

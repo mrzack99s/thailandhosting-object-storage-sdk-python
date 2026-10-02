@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from thailandhosting_objectstorage import Client, IntegrityError, NotFoundError  # noqa: E402
+from thailandhosting_objectstorage import Client, IntegrityError, NotFoundError, ObjectStorageError, PublicRule  # noqa: E402
 
 MiB = 1 << 20
 
@@ -32,6 +32,7 @@ class Fake:
         self.objects = {}
         self.types = {}
         self.uploads = {}
+        self.public = {}  # bucket: [{"prefix", "list"}]
         self.flaky = 0
         self.corrupt = False
         self.inflight = 0
@@ -72,8 +73,18 @@ def make_handler(fake):
                 with fake.lock:
                     fake.inflight -= 1
 
+        def public_read(self):
+            # An unsigned GET or HEAD of an object a bucket made public.
+            if "Authorization" in self.headers or self.command not in ("GET", "HEAD"):
+                return False
+            parts = urlsplit(self.path).path[len("/v1/buckets/"):].split("/", 2)
+            if len(parts) != 3 or parts[1] != "objects":
+                return False
+            key = unquote(parts[2])
+            return any(key.startswith(r["prefix"]) for r in fake.public.get(parts[0], []))
+
         def route(self):
-            if self.headers.get("Authorization") != "Bearer KEY:SECRET":
+            if self.headers.get("Authorization") != "Bearer KEY:SECRET" and not self.public_read():
                 return self.fail(401, "unauthorized")
             body = self.body()
             with fake.lock:
@@ -90,6 +101,10 @@ def make_handler(fake):
                 return self.list(bucket, parse_qs(u.query))
             if len(parts) >= 2 and parts[1] == "uploads":
                 return self.upload(bucket, parts, body)
+            if len(parts) == 2 and parts[1] == "public":
+                if self.command == "PUT":
+                    fake.public[bucket] = json.loads(body)["rules"]
+                return self.send_json(200, {"rules": fake.public.get(bucket, [])})
             self.fail(404, "not_found")
 
         def object(self, bucket, key, body):
@@ -265,6 +280,25 @@ class FakeTest(unittest.TestCase):
         with self.bucket.get("r", offset=10, length=5) as s:
             self.assertEqual(s.read(), bytes(range(10, 15)))
             self.assertEqual(s.info.size, 100)
+
+    def test_public_access(self):
+        self.bucket.put("public/a b.txt", "hello")
+        self.bucket.put("private/x.txt", "secret")
+        rules = self.bucket.set_public_access([PublicRule("public/")])
+        self.assertEqual(rules, [PublicRule("public/", False)])
+        self.assertEqual(self.bucket.public_access(), rules)
+        base = f"http://127.0.0.1:{self.server.server_port}"
+        self.assertEqual(self.bucket.public_url("public/a b.txt"), base + "/b/public/a%20b.txt")
+        # Without a key the client reads what is public, nothing else.
+        anon = Client(base)
+        try:
+            self.assertEqual(anon.bucket("b").get_bytes("public/a b.txt"), b"hello")
+            with self.assertRaises(ObjectStorageError):
+                anon.bucket("b").get_bytes("private/x.txt")
+        finally:
+            anon.close()
+        with self.assertRaises(ValueError):
+            Client(base, "KEY")
 
 
 @unittest.skipUnless(os.environ.get("TH_OBJECT_STORAGE_ENDPOINT"), "TH_OBJECT_STORAGE_ENDPOINT is not set")

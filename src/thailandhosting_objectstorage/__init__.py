@@ -25,6 +25,7 @@ from .client import (
     ObjectInfo,
     ObjectStream,
     Part,
+    PublicRule,
 )
 from .errors import IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError
 
@@ -44,4 +45,5 @@ __all__ = [
     "ObjectStorageError",
     "ObjectStream",
     "Part",
+    "PublicRule",
 ]

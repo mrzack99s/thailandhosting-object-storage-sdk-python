@@ -40,14 +40,29 @@ def _parse_time(value: Optional[str]) -> Optional[datetime]:
 
 
 @dataclass
+class PublicRule:
+    """Makes the objects under ``prefix`` ("" is the whole bucket) readable by
+    anyone without a key; ``list`` also lets anyone list those keys."""
+
+    prefix: str = ""
+    list: bool = False
+
+    @classmethod
+    def _from(cls, d: Mapping[str, Any]) -> "PublicRule":
+        return cls(d.get("prefix", "") or "", bool(d.get("list", False)))
+
+
+@dataclass
 class BucketInfo:
     name: str
     region: str = ""
     created_at: Optional[datetime] = None
+    # What anyone may read; get_bucket fills it, list_buckets does not.
+    public: List[PublicRule] = field(default_factory=list)
 
     @classmethod
     def _from(cls, d: Mapping[str, Any]) -> "BucketInfo":
-        return cls(d.get("name", ""), d.get("region", ""), _parse_time(d.get("createdAt")))
+        return cls(d.get("name", ""), d.get("region", ""), _parse_time(d.get("createdAt")), [PublicRule._from(r) for r in d.get("public") or []])
 
 
 @dataclass
@@ -162,8 +177,8 @@ class Client:
     def __init__(
         self,
         endpoint: str,
-        access_key_id: str,
-        secret_access_key: str,
+        access_key_id: str = "",
+        secret_access_key: str = "",
         *,
         part_size: int = 16 * MiB,
         multipart_threshold: Optional[int] = None,
@@ -174,14 +189,17 @@ class Client:
         pool_maxsize: Optional[int] = None,
         user_agent: str = "",
     ) -> None:
-        if not endpoint or not access_key_id or not secret_access_key:
-            raise ValueError("endpoint, access_key_id and secret_access_key are required")
+        # Without a key the client is anonymous: it reads (and, where allowed,
+        # lists) only what buckets made public.
+        if not endpoint or bool(access_key_id) != bool(secret_access_key):
+            raise ValueError("endpoint is required, and access_key_id and secret_access_key together")
         u = urlsplit(endpoint.rstrip("/"))
         if u.scheme not in ("http", "https") or not u.netloc:
             raise ValueError(f"invalid endpoint {endpoint!r}")
         path = u.path[:-3] if u.path.endswith("/v1") else u.path
-        self._base = f"{u.scheme}://{u.netloc}{path}/v1"
-        self._auth = f"Bearer {access_key_id}:{secret_access_key}"
+        self._origin = f"{u.scheme}://{u.netloc}{path}"
+        self._base = self._origin + "/v1"
+        self._auth = f"Bearer {access_key_id}:{secret_access_key}" if access_key_id else ""
         self.part_size = max(part_size, MIN_PART_SIZE)
         self.multipart_threshold = multipart_threshold or 2 * self.part_size
         self.concurrency = max(1, concurrency)
@@ -211,7 +229,9 @@ class Client:
         url = self._base + path
         if query:
             url += "?" + urlencode({k: v for k, v in query.items() if v not in (None, "")})
-        h = {"Authorization": self._auth, "User-Agent": self._ua}
+        h = {"User-Agent": self._ua}
+        if self._auth:
+            h["Authorization"] = self._auth
         if headers:
             h.update(headers)
         attempt = 0
@@ -469,6 +489,27 @@ class Bucket:
         without an access key, for ``expires_in`` seconds (at most 7 days)."""
         d = self._c._json("POST", self._path + "/links", {"key": key, "expiresIn": int(expires_in), "method": "PUT" if upload else "GET"}, retry_post=True)
         return Link(d["url"], d.get("method", "GET"), _parse_time(d.get("expiresAt")))
+
+    # ---- public access ----
+
+    def public_access(self) -> List[PublicRule]:
+        """What anyone may read in the bucket."""
+        d = self._c._json("GET", self._path + "/public")
+        return [PublicRule._from(r) for r in d.get("rules") or []]
+
+    def set_public_access(self, rules: Sequence[PublicRule]) -> List[PublicRule]:
+        """Replaces what anyone may read: ``[]`` makes the bucket private,
+        ``[PublicRule()]`` opens all of it, ``[PublicRule("images/")]`` one
+        folder. Needs a key allowed to manage buckets; takes effect within
+        about 15 seconds. Returns the rules as stored."""
+        payload = {"rules": [{"prefix": r.prefix, "list": r.list} for r in rules]}
+        d = self._c._json("PUT", self._path + "/public", payload, retry_post=True)
+        return [PublicRule._from(r) for r in d.get("rules") or []]
+
+    def public_url(self, key: str) -> str:
+        """The address anyone can open ``key`` at once its folder (or the
+        bucket) is public. No request is made."""
+        return f"{self._c._origin}/{quote(self.name, safe='')}/{_escape_key(key)}"
 
     # ---- multipart ----
 
