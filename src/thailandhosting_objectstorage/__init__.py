@@ -27,7 +27,14 @@ from .client import (
     Part,
     PublicRule,
 )
-from .errors import IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError
+from .errors import (
+    DigestMismatchError,
+    IntegrityError,
+    NotFoundError,
+    NotModifiedError,
+    ObjectStorageError,
+    PreconditionFailedError,
+)
 
 __version__ = "1.0.0"
 
@@ -35,6 +42,7 @@ __all__ = [
     "Bucket",
     "BucketInfo",
     "Client",
+    "DigestMismatchError",
     "IntegrityError",
     "Link",
     "ListPage",
@@ -45,5 +53,6 @@ __all__ = [
     "ObjectStorageError",
     "ObjectStream",
     "Part",
+    "PreconditionFailedError",
     "PublicRule",
 ]

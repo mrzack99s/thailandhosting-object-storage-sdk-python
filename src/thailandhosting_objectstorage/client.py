@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
+import hmac
 import json
 import mimetypes
 import os
@@ -9,14 +12,15 @@ import threading
 import time
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
-from datetime import datetime
-from email.utils import parsedate_to_datetime
-from typing import IO, Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Union
+from datetime import datetime, timezone
+from email.utils import format_datetime, parsedate_to_datetime
+from typing import IO, Any, Callable, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlencode, urlsplit
 
 import urllib3
+from urllib3.util import parse_url
 
-from .errors import IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError
+from .errors import DigestMismatchError, IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError
 
 __all__ = ["Client", "Bucket", "MultipartUpload"]
 
@@ -26,6 +30,9 @@ MIN_PART_SIZE = 5 * MiB
 MAX_PARTS = 10000
 
 Body = Union[bytes, bytearray, memoryview, str]
+# An HTTP date for if_modified_since / if_unmodified_since: a datetime (naive
+# means UTC) or the header value itself.
+When = Union[datetime, str]
 
 
 def _parse_time(value: Optional[str]) -> Optional[datetime]:
@@ -73,6 +80,10 @@ class ObjectInfo:
     last_modified: Optional[datetime] = None
     content_type: str = ""
     metadata: Dict[str, str] = field(default_factory=dict)
+    # The object's Repr-Digest (RFC 9530), e.g. "sha-256=:<base64>:", from
+    # get and head; "" for objects uploaded in parts. Full downloads are
+    # checked against it.
+    digest: str = ""
 
     @classmethod
     def _from(cls, d: Mapping[str, Any]) -> "ObjectInfo":
@@ -101,6 +112,7 @@ class ObjectInfo:
             last_modified=_parse_time(headers.get("Last-Modified")),
             content_type=headers.get("Content-Type", ""),
             metadata=meta,
+            digest=headers.get("Repr-Digest", ""),
         )
 
 
@@ -143,20 +155,164 @@ def _guess_type(name: str) -> str:
     return mimetypes.guess_type(name)[0] or "application/octet-stream"
 
 
+# ---- HTTP Message Signatures (RFC 9421) and digests (RFC 9530) ----
+
+_SIGNATURE_LABEL = "th"
+
+
+def _content_digest(data: bytes) -> str:
+    """The Content-Digest (RFC 9530) of a body."""
+    return "sha-256=:" + base64.b64encode(hashlib.sha256(data).digest()).decode() + ":"
+
+
+def _sha256_of(digest: str) -> Optional[bytes]:
+    """The sha-256 member of a Content-Digest / Repr-Digest value, if any."""
+    for member in digest.split(","):
+        name, _, value = member.split(";", 1)[0].strip().partition("=")
+        value = value.strip()
+        if name.strip().lower() == "sha-256" and len(value) > 2 and value[0] == value[-1] == ":":
+            try:
+                return base64.b64decode(value[1:-1], validate=True)
+            except (binascii.Error, ValueError):
+                return None
+    return None
+
+
+def _sf_string(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _sign_request(
+    method: str,
+    authority: str,
+    path: str,
+    query: str,
+    content_digest: Optional[str],
+    key_id: str,
+    secret: str,
+    created: int,
+) -> Tuple[str, str, str]:
+    """Signs one request with HMAC-SHA256 under the secret, which is never
+    sent. Returns (Signature-Input, Signature, the signature base). ``path``
+    and ``query`` are exactly as on the request line (percent-encoded, the
+    query without its "?"); ``content_digest`` is the Content-Digest header
+    sent with a body, or None without one."""
+    components = ["@method", "@authority", "@path", "@query"]
+    values = [method.upper(), authority, path or "/", "?" + query]
+    if content_digest is not None:
+        components.append("content-digest")
+        values.append(content_digest)
+    params = "(" + " ".join(_sf_string(c) for c in components) + ")"
+    params += f";created={int(created)};keyid={_sf_string(key_id)};alg=\"hmac-sha256\""
+    lines = [f"{_sf_string(c)}: {v}" for c, v in zip(components, values)]
+    lines.append('"@signature-params": ' + params)
+    base = "\n".join(lines)
+    mac = hmac.new(secret.encode(), base.encode(), hashlib.sha256).digest()
+    return f"{_SIGNATURE_LABEL}={params}", f"{_SIGNATURE_LABEL}=:{base64.b64encode(mac).decode()}:", base
+
+
+def _authority(netloc: str) -> str:
+    """@authority: the Host header as sent, lower case, without :443 / :80."""
+    host = netloc.rpartition("@")[2].lower()
+    for default in (":443", ":80"):
+        if host.endswith(default):
+            host = host[: -len(default)]
+    return host
+
+
+# ---- conditional requests (RFC 9110) ----
+
+
+def _etag_list(value: str) -> str:
+    """An If-Match / If-None-Match value: "*", or ETags (bare or quoted,
+    comma-separated) each quoted."""
+    if value.strip() == "*":
+        return "*"
+    out = []
+    for v in value.split(","):
+        v = v.strip()
+        if not v:
+            continue
+        if not (v.startswith('W/"') or (len(v) > 1 and v[0] == v[-1] == '"')):
+            v = '"' + v.strip('"') + '"'
+        out.append(v)
+    return ", ".join(out)
+
+
+def _http_date(when: When) -> str:
+    if isinstance(when, str):
+        return when
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return format_datetime(when.astimezone(timezone.utc), usegmt=True)
+
+
+def _cond_headers(
+    if_match: Optional[str] = None,
+    if_none_match: Optional[str] = None,
+    if_modified_since: Optional[When] = None,
+    if_unmodified_since: Optional[When] = None,
+) -> Dict[str, str]:
+    h: Dict[str, str] = {}
+    if if_match:
+        h["If-Match"] = _etag_list(if_match)
+    if if_none_match:
+        h["If-None-Match"] = _etag_list(if_none_match)
+    if if_modified_since is not None:
+        h["If-Modified-Since"] = _http_date(if_modified_since)
+    if if_unmodified_since is not None:
+        h["If-Unmodified-Since"] = _http_date(if_unmodified_since)
+    return h
+
+
+def _check_digest(want: Optional[bytes], got: bytes, key: str) -> None:
+    if want is not None and not hmac.compare_digest(want, got):
+        raise DigestMismatchError(
+            f"{key}: the downloaded data does not match its Repr-Digest "
+            f"(sha-256 {base64.b64encode(want).decode()}, got {base64.b64encode(got).decode()})"
+        )
+
+
 class ObjectStream:
     """A download in progress. Iterate with ``iter_chunks()``, ``read()`` it,
-    or use it as a context manager; close it when done."""
+    or use it as a context manager; close it when done. A whole-object
+    download that carries a Repr-Digest is checked as it is read: reading the
+    last byte raises ``DigestMismatchError`` when the data was damaged."""
 
-    def __init__(self, response: urllib3.BaseHTTPResponse, info: ObjectInfo) -> None:
+    def __init__(self, response: urllib3.BaseHTTPResponse, info: ObjectInfo, verify: bool = False) -> None:
         self._resp = response
         self.info = info
         self.content_range = response.headers.get("Content-Range")
+        self._want = _sha256_of(info.digest) if verify else None
+        self._hash = hashlib.sha256() if self._want is not None else None
+        self._seen = 0
+
+    def _feed(self, data: bytes) -> None:
+        if self._hash is None:
+            return
+        self._hash.update(data)
+        self._seen += len(data)
+        if self._seen >= self.info.size:
+            self._finish()
+
+    def _finish(self) -> None:
+        if self._hash is not None:
+            h, self._hash = self._hash, None
+            _check_digest(self._want, h.digest(), self.info.key)
 
     def read(self, amt: Optional[int] = None) -> bytes:
-        return self._resp.read(amt)
+        data = self._resp.read(amt)
+        if data:
+            self._feed(data)
+        if amt is None or (not data and amt):
+            self._finish()
+        return data
 
     def iter_chunks(self, chunk_size: int = 1 * MiB) -> Iterator[bytes]:
-        yield from self._resp.stream(chunk_size)
+        for chunk in self._resp.stream(chunk_size):
+            self._feed(chunk)
+            yield chunk
+        self._finish()
 
     def close(self) -> None:
         self._resp.release_conn()
@@ -199,7 +355,11 @@ class Client:
         path = u.path[:-3] if u.path.endswith("/v1") else u.path
         self._origin = f"{u.scheme}://{u.netloc}{path}"
         self._base = self._origin + "/v1"
-        self._auth = f"Bearer {access_key_id}:{secret_access_key}" if access_key_id else ""
+        # Requests are signed (HTTP Message Signatures, RFC 9421); the secret
+        # itself never leaves this process.
+        self._key_id = access_key_id
+        self._secret = secret_access_key
+        self._authority = _authority(u.netloc)
         self.part_size = max(part_size, MIN_PART_SIZE)
         self.multipart_threshold = multipart_threshold or 2 * self.part_size
         self.concurrency = max(1, concurrency)
@@ -230,12 +390,26 @@ class Client:
         if query:
             url += "?" + urlencode({k: v for k, v in query.items() if v not in (None, "")})
         h = {"User-Agent": self._ua}
-        if self._auth:
-            h["Authorization"] = self._auth
         if headers:
             h.update(headers)
+        if body is None and method in ("PUT", "POST"):
+            body = b""
+        if body is not None:
+            # Every body carries its digest (RFC 9530), known before it is
+            # sent: bodies here are always in memory. The service checks it
+            # against the bytes as they arrive and stores nothing on a
+            # mismatch (400 bad_digest).
+            body = body.encode() if isinstance(body, str) else bytes(body)
+            h["Content-Digest"] = _content_digest(body)
+        # The path and query exactly as urllib3 puts them on the request line.
+        target = parse_url(url)
         attempt = 0
         while True:
+            if self._key_id:
+                # Signed afresh on every attempt: created must be recent.
+                h["Signature-Input"], h["Signature"], _ = _sign_request(
+                    method, self._authority, target.path or "/", target.query or "", h.get("Content-Digest"), self._key_id, self._secret, int(time.time())
+                )
             try:
                 resp = self._http.request(method, url, body=body, headers=h, preload_content=not stream, redirect=False)
             except urllib3.exceptions.HTTPError:
@@ -262,6 +436,7 @@ class Client:
         d = min(0.2 * (2 ** min(attempt, 6)), 10.0)
         d = d / 2 + random.uniform(0, d / 2)
         if retry_after:
+            # Retry-After (seconds; 503 busy sends 1) is the least we wait.
             try:
                 d = max(d, min(float(retry_after), 30.0))
             except ValueError:
@@ -272,24 +447,35 @@ class Client:
     def _error(resp: urllib3.BaseHTTPResponse) -> ObjectStorageError:
         data = resp.data if resp.data is not None else b""
         resp.release_conn()
+        # Problem Details (RFC 9457): {"type","title","status","code","instance"}.
+        # A HEAD answer has no body; its code is in X-Error-Code.
         code = resp.headers.get("X-Error-Code") or ""
         message = resp.reason or ""
         try:
-            doc = json.loads(data or b"{}").get("error") or {}
-            code, message = doc.get("code") or code, doc.get("message") or message
+            doc = json.loads(data or b"{}")
+            code, message = doc.get("code") or code, doc.get("title") or message
         except (ValueError, AttributeError):
             pass
-        code = code or (resp.reason or "error").lower().replace(" ", "_")
-        cls = NotFoundError if resp.status == 404 else ObjectStorageError
-        return cls(resp.status, code, message)
+        code = str(code or (resp.reason or "error").lower().replace(" ", "_"))
+        cls = {404: NotFoundError, 412: PreconditionFailedError}.get(resp.status, ObjectStorageError)
+        return cls(resp.status, code, str(message))
 
-    def _json(self, method: str, path: str, payload: Any = None, *, query: Optional[Mapping[str, Any]] = None, retry_post: bool = False) -> Any:
+    def _json(
+        self,
+        method: str,
+        path: str,
+        payload: Any = None,
+        *,
+        query: Optional[Mapping[str, Any]] = None,
+        retry_post: bool = False,
+        headers: Optional[Mapping[str, str]] = None,
+    ) -> Any:
         body = None
-        headers = None
+        h: Dict[str, str] = dict(headers or {})
         if payload is not None:
             body = json.dumps(payload).encode()
-            headers = {"Content-Type": "application/json"}
-        resp = self._request(method, path, query=query, headers=headers, body=body, retry_post=retry_post)
+            h["Content-Type"] = "application/json"
+        resp = self._request(method, path, query=query, headers=h, body=body, retry_post=retry_post)
         if not resp.data:
             return None
         return json.loads(resp.data)
@@ -339,8 +525,10 @@ def _put_headers(
     content_disposition: Optional[str],
     content_encoding: Optional[str],
     if_not_exists: bool,
+    if_match: Optional[str] = None,
+    if_none_match: Optional[str] = None,
 ) -> Dict[str, str]:
-    h: Dict[str, str] = {}
+    h = _write_conds(if_not_exists, if_match, if_none_match)
     if content_type:
         h["Content-Type"] = content_type
     if cache_control:
@@ -351,9 +539,13 @@ def _put_headers(
         h["Content-Encoding"] = content_encoding
     for k, v in (metadata or {}).items():
         h["X-Meta-" + k] = v
-    if if_not_exists:
-        h["If-None-Match"] = "*"
     return h
+
+
+def _write_conds(if_not_exists: bool, if_match: Optional[str], if_none_match: Optional[str]) -> Dict[str, str]:
+    """The conditions of a write, which the service checks atomically with
+    it: ``if_not_exists`` is ``if_none_match="*"`` (create only)."""
+    return _cond_headers(if_match, "*" if if_not_exists else if_none_match)
 
 
 def _run_parallel(workers: int, count: int, fn: Callable[[int], Any]) -> List[Any]:
@@ -399,12 +591,21 @@ class Bucket:
         content_disposition: Optional[str] = None,
         content_encoding: Optional[str] = None,
         if_not_exists: bool = False,
+        if_match: Optional[str] = None,
+        if_none_match: Optional[str] = None,
     ) -> ObjectInfo:
         """Upload ``data`` (bytes or str) in one request. Use ``upload_file``
-        or ``upload_fileobj`` for large or streamed data."""
+        or ``upload_fileobj`` for large or streamed data.
+
+        ``if_match`` (ETags or ``"*"``) writes only over that version;
+        ``if_none_match="*"`` (or ``if_not_exists=True``) only when the key is
+        free. Otherwise nothing is written and ``PreconditionFailedError`` is
+        raised."""
         if isinstance(data, str):
             data = data.encode()
-        headers = _put_headers(content_type or _guess_type(key), metadata, cache_control, content_disposition, content_encoding, if_not_exists)
+        headers = _put_headers(
+            content_type or _guess_type(key), metadata, cache_control, content_disposition, content_encoding, if_not_exists, if_match, if_none_match
+        )
         resp = self._c._request("PUT", self._obj(key), headers=headers, body=bytes(data))
         info = ObjectInfo._from(json.loads(resp.data))
         _check_etag(info.etag, _md5(data), key)
@@ -418,29 +619,61 @@ class Bucket:
         length: Optional[int] = None,
         if_none_match: Optional[str] = None,
         if_match: Optional[str] = None,
+        if_modified_since: Optional[When] = None,
+        if_unmodified_since: Optional[When] = None,
     ) -> ObjectStream:
         """Stream an object (or ``length`` bytes from ``offset``). Close the
-        stream, or use ``with``. ``info.size`` is the whole object's size."""
-        headers: Dict[str, str] = {}
+        stream, or use ``with``. ``info.size`` is the whole object's size.
+
+        ``if_none_match`` / ``if_modified_since`` raise ``NotModifiedError``
+        when a cached copy is current; ``if_match`` / ``if_unmodified_since``
+        raise ``PreconditionFailedError`` when the object changed. A whole
+        object is checked against its Repr-Digest as it is read."""
+        headers = _cond_headers(if_match, if_none_match, if_modified_since, if_unmodified_since)
         if offset or length:
             headers["Range"] = f"bytes={offset}-{offset + length - 1}" if length else f"bytes={offset}-"
-        if if_none_match:
-            headers["If-None-Match"] = '"' + if_none_match.strip('"') + '"'
-        if if_match:
-            headers["If-Match"] = '"' + if_match.strip('"') + '"'
         resp = self._c._request("GET", self._obj(key), headers=headers, stream=True, expect=(200, 206, 304))
         if resp.status == 304:
             resp.release_conn()
             raise NotModifiedError(key)
-        return ObjectStream(resp, ObjectInfo._from_headers(key, resp.headers))
+        return ObjectStream(resp, ObjectInfo._from_headers(key, resp.headers), verify=resp.status == 200)
 
-    def get_bytes(self, key: str) -> bytes:
-        """Download a whole object into memory."""
-        resp = self._c._request("GET", self._obj(key))
-        return resp.data
+    def get_bytes(
+        self,
+        key: str,
+        *,
+        if_none_match: Optional[str] = None,
+        if_match: Optional[str] = None,
+        if_modified_since: Optional[When] = None,
+        if_unmodified_since: Optional[When] = None,
+    ) -> bytes:
+        """Download a whole object into memory, checked against its
+        Repr-Digest. Conditions as for ``get``."""
+        headers = _cond_headers(if_match, if_none_match, if_modified_since, if_unmodified_since)
+        resp = self._c._request("GET", self._obj(key), headers=headers, expect=(200, 304))
+        if resp.status == 304:
+            raise NotModifiedError(key)
+        data = resp.data
+        want = _sha256_of(resp.headers.get("Repr-Digest", ""))
+        if want is not None:
+            _check_digest(want, hashlib.sha256(data).digest(), key)
+        return data
 
-    def head(self, key: str) -> ObjectInfo:
-        resp = self._c._request("HEAD", self._obj(key))
+    def head(
+        self,
+        key: str,
+        *,
+        if_none_match: Optional[str] = None,
+        if_match: Optional[str] = None,
+        if_modified_since: Optional[When] = None,
+        if_unmodified_since: Optional[When] = None,
+    ) -> ObjectInfo:
+        """The object's size, ETag, type, metadata and digest. Conditions as
+        for ``get``."""
+        headers = _cond_headers(if_match, if_none_match, if_modified_since, if_unmodified_since)
+        resp = self._c._request("HEAD", self._obj(key), headers=headers, expect=(200, 304))
+        if resp.status == 304:
+            raise NotModifiedError(key)
         return ObjectInfo._from_headers(key, resp.headers)
 
     def exists(self, key: str) -> bool:
@@ -450,9 +683,11 @@ class Bucket:
         except NotFoundError:
             return False
 
-    def delete(self, key: str) -> None:
-        """Delete an object; deleting a missing one succeeds."""
-        self._c._request("DELETE", self._obj(key))
+    def delete(self, key: str, *, if_match: Optional[str] = None, if_none_match: Optional[str] = None) -> None:
+        """Delete an object; deleting a missing one succeeds (unless
+        ``if_match`` asked for a version). ``if_match`` deletes only that
+        version, else ``PreconditionFailedError``."""
+        self._c._request("DELETE", self._obj(key), headers=_cond_headers(if_match, if_none_match))
 
     def delete_many(self, keys: Sequence[str]) -> None:
         """Delete keys in parallel."""
@@ -534,15 +769,31 @@ class Bucket:
         metadata: Optional[Mapping[str, str]] = None,
         cache_control: Optional[str] = None,
         content_disposition: Optional[str] = None,
+        if_not_exists: bool = False,
+        if_match: Optional[str] = None,
+        if_none_match: Optional[str] = None,
     ) -> ObjectInfo:
         """Upload a local file. Large files go up as parts read from the file
-        and sent in parallel; each part is re-read if it must be sent again."""
+        and sent in parallel; each part is re-read if it must be sent again.
+        Conditions as for ``put``; a large upload applies them when its parts
+        are joined, and is aborted when they do not hold."""
         path = os.fspath(path)
         size = os.path.getsize(path)
         content_type = content_type or _guess_type(path)
+        if if_not_exists:
+            if_none_match = "*"
         if size <= self._c.multipart_threshold:
             with open(path, "rb") as f:
-                return self.put(key, f.read(), content_type=content_type, metadata=metadata, cache_control=cache_control, content_disposition=content_disposition)
+                return self.put(
+                    key,
+                    f.read(),
+                    content_type=content_type,
+                    metadata=metadata,
+                    cache_control=cache_control,
+                    content_disposition=content_disposition,
+                    if_match=if_match,
+                    if_none_match=if_none_match,
+                )
         ps = self._c._part_size_for(size)
         count = -(-size // ps)
         up = self.create_multipart_upload(key, content_type=content_type, metadata=metadata)
@@ -560,7 +811,7 @@ class Bucket:
         handles: List[IO[bytes]] = []
         try:
             parts = _run_parallel(self._c.concurrency, count, send)
-            return up.complete(parts)
+            return up.complete(parts, if_match=if_match, if_none_match=if_none_match)
         except BaseException:
             up._abort_quietly()
             raise
@@ -575,14 +826,21 @@ class Bucket:
         *,
         content_type: Optional[str] = None,
         metadata: Optional[Mapping[str, str]] = None,
+        if_not_exists: bool = False,
+        if_match: Optional[str] = None,
+        if_none_match: Optional[str] = None,
     ) -> ObjectInfo:
         """Upload what a binary stream yields (a pipe, a socket, a generated
         export) without knowing its size. Parts are read one after another and
-        sent in parallel, holding at most ``concurrency + 1`` in memory."""
+        sent in parallel, holding at most ``concurrency + 1`` in memory. Each
+        request's Content-Digest is hashed from that buffer, so the stream need
+        not be seekable. Conditions as for ``upload_file``."""
+        if if_not_exists:
+            if_none_match = "*"
         ps = self._c.part_size
         first = _read_full(fileobj, ps)
         if len(first) < ps:
-            return self.put(key, first, content_type=content_type, metadata=metadata)
+            return self.put(key, first, content_type=content_type, metadata=metadata, if_match=if_match, if_none_match=if_none_match)
         up = self.create_multipart_upload(key, content_type=content_type, metadata=metadata)
         slots = threading.BoundedSemaphore(self._c.concurrency)
         try:
@@ -607,7 +865,7 @@ class Bucket:
                     n += 1
                     data = _read_full(fileobj, ps)
                 parts = [f.result() for f in futures]
-            return up.complete(parts)
+            return up.complete(parts, if_match=if_match, if_none_match=if_none_match)
         except BaseException:
             up._abort_quietly()
             raise
@@ -615,7 +873,8 @@ class Bucket:
     def download_file(self, key: str, path: Union[str, "os.PathLike[str]"]) -> ObjectInfo:
         """Save an object to ``path``. Large objects come down as parallel
         ranges pinned to the object's ETag. The data is written to
-        ``path + '.download'`` and renamed into place."""
+        ``path + '.download'``, checked against the object's Repr-Digest
+        (``DigestMismatchError``) and renamed into place."""
         path = os.fspath(path)
         info = self.head(key)
         tmp = path + ".download"
@@ -648,6 +907,11 @@ class Bucket:
                 finally:
                     for f in handles:
                         f.close()
+                # The ranges arrive out of order: check the whole file once
+                # they are all in (objects uploaded in parts have no digest).
+                want = _sha256_of(info.digest)
+                if want is not None:
+                    _check_digest(want, _sha256_file(tmp), key)
             os.replace(tmp, path)
         except BaseException:
             try:
@@ -678,6 +942,14 @@ class Bucket:
                 attempt += 1
 
 
+def _sha256_file(path: str) -> bytes:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(MiB), b""):
+            h.update(chunk)
+    return h.digest()
+
+
 def _read_full(f: IO[bytes], n: int) -> bytes:
     """Reads up to n bytes, looping over short reads (pipes, sockets)."""
     buf = bytearray()
@@ -704,7 +976,8 @@ class MultipartUpload:
 
     def upload_part(self, number: int, data: Body) -> Part:
         """Send part ``number`` (1-10000); every part but the last must be at
-        least 5 MiB. Sending a number again replaces that part."""
+        least 5 MiB. Sending a number again replaces that part. The part
+        carries its own Content-Digest."""
         data = bytes(data) if not isinstance(data, bytes) else data
         resp = self.bucket._c._request(
             "PUT", f"{self._path()}/parts/{int(number)}", headers={"Content-Type": "application/octet-stream"}, body=data
@@ -717,14 +990,18 @@ class MultipartUpload:
         d = self.bucket._c._json("GET", self._path())
         return [Part(int(p["number"]), str(p["etag"]).strip('"'), int(p.get("size", 0))) for p in d.get("parts", [])]
 
-    def complete(self, parts: Optional[Sequence[Part]] = None) -> ObjectInfo:
+    def complete(self, parts: Optional[Sequence[Part]] = None, *, if_match: Optional[str] = None, if_none_match: Optional[str] = None) -> ObjectInfo:
         """Join the parts into the object; without ``parts``, every part
-        received, in order."""
+        received, in order. ``if_match`` / ``if_none_match`` are checked
+        atomically with the join (``PreconditionFailedError``: the object is
+        not written)."""
         payload = None
         if parts is not None:
             payload = {"parts": [{"number": p.number, "etag": p.etag} for p in sorted(parts, key=lambda p: p.number)]}
         try:
-            return ObjectInfo._from(self.bucket._c._json("POST", self._path() + "/complete", payload, retry_post=True))
+            return ObjectInfo._from(
+                self.bucket._c._json("POST", self._path() + "/complete", payload, retry_post=True, headers=_cond_headers(if_match, if_none_match))
+            )
         except NotFoundError:
             # A retry after a completion whose answer was lost.
             return self.bucket.head(self.key)
