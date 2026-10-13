@@ -16,7 +16,7 @@ import os
 from thailandhosting_objectstorage import Client, NotFoundError
 
 client = Client(
-    endpoint="https://objects.bkk.thailandhosting.com",
+    endpoint="https://objects.thailandhosting.com/th-bkk-1",
     access_key_id=os.environ["TH_ACCESS_KEY_ID"],
     secret_access_key=os.environ["TH_SECRET_ACCESS_KEY"],
 )
@@ -109,10 +109,10 @@ from thailandhosting_objectstorage import Client, PublicRule
 # allowed to manage buckets. [] makes the bucket private again.
 bucket.set_public_access([PublicRule("images/")])
 print(bucket.public_url("images/logo.png"))
-# https://objects.bkk.thailandhosting.com/my-bucket/images/logo.png
+# https://objects.thailandhosting.com/th-bkk-1/my-bucket/images/logo.png
 
 # A client without a key reads (and, where allowed, lists) public objects.
-anon = Client("https://objects.bkk.thailandhosting.com")
+anon = Client("https://objects.thailandhosting.com/th-bkk-1")
 data = anon.bucket("my-bucket").get_bytes("images/logo.png")
 ```
 

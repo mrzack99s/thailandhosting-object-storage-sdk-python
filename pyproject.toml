@@ -18,6 +18,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://www.thailandhosting.com"
+Source = "https://github.com/mrzack99s/thailandhosting-object-storage-sdk-python"
 
 [tool.setuptools.packages.find]
 where = ["src"]
