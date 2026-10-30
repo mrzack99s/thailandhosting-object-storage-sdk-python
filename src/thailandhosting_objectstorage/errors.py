@@ -16,6 +16,11 @@ class ObjectStorageError(Exception):
         self.message = message
 
 
+class TokenError(Exception):
+    """The ``token_provider`` failed or gave no token: nothing was sent. Its
+    exception is the ``__cause__``. Not retried."""
+
+
 class NotFoundError(ObjectStorageError):
     """The bucket, object or upload does not exist."""
 

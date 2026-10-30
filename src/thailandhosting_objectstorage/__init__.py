@@ -34,6 +34,7 @@ from .errors import (
     NotModifiedError,
     ObjectStorageError,
     PreconditionFailedError,
+    TokenError,
 )
 
 __version__ = "1.0.0"
@@ -55,4 +56,5 @@ __all__ = [
     "Part",
     "PreconditionFailedError",
     "PublicRule",
+    "TokenError",
 ]

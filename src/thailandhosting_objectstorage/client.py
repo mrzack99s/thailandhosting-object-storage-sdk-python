@@ -20,7 +20,7 @@ from urllib.parse import quote, urlencode, urlsplit
 import urllib3
 from urllib3.util import parse_url
 
-from .errors import DigestMismatchError, IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError
+from .errors import DigestMismatchError, IntegrityError, NotFoundError, NotModifiedError, ObjectStorageError, PreconditionFailedError, TokenError
 
 __all__ = ["Client", "Bucket", "MultipartUpload"]
 
@@ -327,6 +327,17 @@ class ObjectStream:
 _RETRY_STATUSES = {429, 500, 502, 503, 504}
 
 
+def _bearer(provider: Callable[[], str]) -> str:
+    """The Authorization value from a token provider; its failure is a TokenError."""
+    try:
+        token = provider()
+    except Exception as e:
+        raise TokenError(f"token_provider failed: {e}") from e
+    if not token or not isinstance(token, str):
+        raise TokenError("token_provider gave no token")
+    return "Bearer " + token
+
+
 class Client:
     """A client of one region's Object Storage endpoint. Thread-safe."""
 
@@ -344,11 +355,18 @@ class Client:
         read_timeout: float = 120.0,
         pool_maxsize: Optional[int] = None,
         user_agent: str = "",
+        token_provider: Optional[Callable[[], str]] = None,
     ) -> None:
         # Without a key the client is anonymous: it reads (and, where allowed,
         # lists) only what buckets made public.
         if not endpoint or bool(access_key_id) != bool(secret_access_key):
             raise ValueError("endpoint is required, and access_key_id and secret_access_key together")
+        # token_provider, instead of a key, gives a service account's
+        # short-lived token, sent as Authorization: Bearer with no signature.
+        # It is called before every attempt, retries included, and from the
+        # transfer threads, so it should cache and refresh, and be thread-safe.
+        if token_provider is not None and access_key_id:
+            raise ValueError("give an access key or token_provider, not both")
         u = urlsplit(endpoint.rstrip("/"))
         if u.scheme not in ("http", "https") or not u.netloc:
             raise ValueError(f"invalid endpoint {endpoint!r}")
@@ -359,6 +377,7 @@ class Client:
         # itself never leaves this process.
         self._key_id = access_key_id
         self._secret = secret_access_key
+        self._token_provider = token_provider
         self._authority = _authority(u.netloc)
         self.part_size = max(part_size, MIN_PART_SIZE)
         self.multipart_threshold = multipart_threshold or 2 * self.part_size
@@ -405,7 +424,9 @@ class Client:
         target = parse_url(url)
         attempt = 0
         while True:
-            if self._key_id:
+            if self._token_provider is not None:
+                h["Authorization"] = _bearer(self._token_provider)
+            elif self._key_id:
                 # Signed afresh on every attempt: created must be recent.
                 h["Signature-Input"], h["Signature"], _ = _sign_request(
                     method, self._authority, target.path or "/", target.query or "", h.get("Content-Digest"), self._key_id, self._secret, int(time.time())
@@ -721,7 +742,10 @@ class Bucket:
 
     def create_link(self, key: str, *, expires_in: int = 3600, upload: bool = False) -> Link:
         """A URL that downloads (or, with ``upload=True``, uploads) one object
-        without an access key, for ``expires_in`` seconds (at most 7 days)."""
+        without an access key, for ``expires_in`` seconds (at most 7 days).
+        Needs a client with an access key."""
+        if self._c._token_provider is not None:
+            raise ValueError("create_link needs an access key: a link is signed with the key's secret, and a service account has none")
         d = self._c._json("POST", self._path + "/links", {"key": key, "expiresIn": int(expires_in), "method": "PUT" if upload else "GET"}, retry_post=True)
         return Link(d["url"], d.get("method", "GET"), _parse_time(d.get("expiresAt")))
 

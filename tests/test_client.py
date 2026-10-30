@@ -28,6 +28,7 @@ from thailandhosting_objectstorage import (  # noqa: E402
     ObjectStorageError,
     PreconditionFailedError,
     PublicRule,
+    TokenError,
 )
 from thailandhosting_objectstorage.client import _sign_request  # noqa: E402
 
@@ -187,8 +188,10 @@ def make_handler(fake):
             body = self.body()
             accept = {"Accept-Signature": 'th=("@method" "@authority" "@path" "@query" "content-digest");alg="hmac-sha256"'}
             if "Authorization" in self.headers:
-                return self.fail(401, "unauthorized", accept)  # Bearer is gone
-            if "Signature-Input" in self.headers:
+                # A service account's token; an "id:secret" Bearer is gone.
+                if not self.headers["Authorization"].startswith("Bearer tok-"):
+                    return self.fail(401, "unauthorized", accept)
+            elif "Signature-Input" in self.headers:
                 code = self.verify_signature()
                 if code:
                     return self.fail(401, code, accept)
@@ -587,6 +590,103 @@ class FakeTest(unittest.TestCase):
         self.bucket.download_file("big", dst)
         with open(dst, "rb") as f:
             self.assertEqual(f.read(), big)
+
+
+class TokenProviderTest(unittest.TestCase):
+    def setUp(self):
+        self.fake = Fake()
+        self.server = QuietServer(("127.0.0.1", 0), make_handler(self.fake))
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.endpoint = f"http://127.0.0.1:{self.server.server_port}"
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.tmp.cleanup()
+
+    def test_bearer_on_every_attempt_through_large_transfers(self):
+        calls = []
+        lock = threading.Lock()
+
+        def provider():
+            with lock:
+                calls.append(1)
+                return f"tok-{len(calls)}"
+
+        c = Client(self.endpoint, token_provider=provider, part_size=5 * MiB, concurrency=4)
+        b = c.bucket("b")
+        self.fake.flaky = 1
+        b.put("small", b"data")
+        self.assertEqual([h["Authorization"] for h in self.fake.headers_seen], ["Bearer tok-1", "Bearer tok-2"])
+
+        data = os.urandom(12 * MiB)
+        b.upload_fileobj("big", io.BytesIO(data))
+        self.assertEqual(sum("/parts/" in d[1] for d in self.fake.digests), 3)
+        path = os.path.join(self.tmp.name, "big")
+        b.download_file("big", path)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), data)
+        self.assertEqual(len(calls), len(self.fake.headers_seen))
+        for h in self.fake.headers_seen:
+            self.assertRegex(h["Authorization"], r"^Bearer tok-\d+$")
+            self.assertNotIn("Signature", h)
+            self.assertNotIn("Signature-Input", h)
+        c.close()
+
+    def test_failure_sends_nothing_and_retries_nothing(self):
+        calls = []
+        boom = ConnectionError("boom")
+
+        def provider():
+            calls.append(1)
+            raise boom
+
+        c = Client(self.endpoint, token_provider=provider)
+        with self.assertRaises(TokenError) as e:
+            c.bucket("b").put("k", b"data")
+        self.assertIs(e.exception.__cause__, boom)
+        self.assertEqual(len(calls), 1)
+        with self.assertRaises(TokenError):
+            Client(self.endpoint, token_provider=lambda: "").list_buckets()
+        self.assertEqual(self.fake.requests, 0)
+        c.close()
+
+    def test_failure_during_a_parallel_download_is_not_a_broken_connection(self):
+        key = Client(self.endpoint, "KEY", "SECRET", part_size=5 * MiB)
+        key.bucket("b").upload_fileobj("big", io.BytesIO(os.urandom(12 * MiB)))
+        key.close()
+        calls = []
+
+        def provider():
+            calls.append(1)
+            if len(calls) > 1:
+                raise ConnectionError("boom")
+            return "tok-head"
+
+        c = Client(self.endpoint, token_provider=provider, part_size=5 * MiB, concurrency=1)
+        with self.assertRaises(TokenError):
+            c.bucket("b").download_file("big", os.path.join(self.tmp.name, "failed"))
+        # The head, then at most each of the 3 ranges once: none was tried again.
+        self.assertLessEqual(len(calls), 4)
+        c.close()
+
+    def test_create_link_needs_an_access_key(self):
+        c = Client(self.endpoint, token_provider=lambda: "tok-1")
+        with self.assertRaisesRegex(ValueError, "create_link needs an access key"):
+            c.bucket("b").create_link("k")
+        self.assertEqual(self.fake.requests, 0)
+        self.assertEqual(c.bucket("b").public_url("k"), self.endpoint + "/b/k")
+        c.close()
+
+    def test_key_or_provider_not_both(self):
+        # Neither is the anonymous client of public buckets (test_public_access),
+        # which sends no credentials.
+        provider = lambda: "tok-1"  # noqa: E731
+        for args in (("KEY", "SECRET"), ("KEY", ""), ("", "SECRET")):
+            with self.assertRaises(ValueError):
+                Client(self.endpoint, *args, token_provider=provider)
+        Client(self.endpoint, token_provider=provider).close()
 
 
 class SigningTest(unittest.TestCase):
