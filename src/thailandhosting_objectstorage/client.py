@@ -24,7 +24,7 @@ from .errors import DigestMismatchError, IntegrityError, NotFoundError, NotModif
 
 __all__ = ["Client", "Bucket", "MultipartUpload"]
 
-VERSION = "1.0.0"
+VERSION = "1.1.1"
 MiB = 1 << 20
 MIN_PART_SIZE = 5 * MiB
 MAX_PARTS = 10000
